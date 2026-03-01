@@ -5,6 +5,8 @@ Sends relevant chunks to external APIs (OpenAI, Claude, etc.) for enhanced analy
 
 import os
 import json
+import shutil
+import subprocess
 import requests
 import httpx
 import asyncio
@@ -45,8 +47,9 @@ class ExternalAPIClient:
         Initialize ExternalAPIClient with API provider configuration.
 
         Args:
-            api_provider: API provider to use ("openai", "gemini", "grok", "anthropic")
+            api_provider: API provider to use ("openai", "gemini", "grok", "anthropic", "claude-cli")
             api_key: Optional API key. If not provided, will look in environment.
+                     Not used for "claude-cli" provider.
         """
         self.api_provider = api_provider
         self.api_key = self._load_api_key(api_key)
@@ -86,6 +89,13 @@ class ExternalAPIClient:
             # Initialize async Anthropic client
             self.async_anthropic_client = anthropic.AsyncAnthropic(api_key=key)
             return key
+        elif self.api_provider == "claude-cli":
+            # No API key needed — calls go through the claude CLI binary
+            if not shutil.which("claude"):
+                raise ConfigurationError(
+                    "claude CLI not found on PATH. Install Claude Code or add it to PATH."
+                )
+            return ""
         else:
             raise ConfigurationError(f"Unsupported API provider: {self.api_provider}")
     
@@ -99,11 +109,16 @@ class ExternalAPIClient:
             return ""  # Grok uses SDK, not REST base URL
         elif self.api_provider == "anthropic":
             return ""  # Anthropic uses SDK, not REST base URL
+        elif self.api_provider == "claude-cli":
+            return ""  # CLI provider uses subprocess, not HTTP
         else:
             raise ConfigurationError(f"Unsupported API provider: {self.api_provider}")
 
     def _fetch_available_models(self) -> List[str]:
         """Fetch available model ids for this API key."""
+        if self.api_provider == "claude-cli":
+            # CLI provider doesn't support listing models via HTTP
+            return []
         try:
             headers = {"Authorization": f"Bearer {self.api_key}"}
             resp = requests.get(f"{self.base_url}/models", headers=headers, timeout=10)
@@ -151,7 +166,9 @@ class ExternalAPIClient:
             ]
             
             # Route to appropriate API based on provider
-            if self.api_provider == "gemini":
+            if self.api_provider == "claude-cli":
+                response_json = self._call_claude_cli_api(model, messages, max_tokens, **options)
+            elif self.api_provider == "gemini":
                 response_json = self._call_gemini_api(model, messages, max_tokens=max_tokens, **options)
             elif self.api_provider == "grok":
                 response_json = self._call_grok_api(model, messages, max_tokens=max_tokens, **options)
@@ -174,11 +191,11 @@ class ExternalAPIClient:
                     content = str(content)
 
             return content
-            
+
         except Exception as e:
             logger.error(f"Direct query failed: {e}", exc_info=True)
             raise ApiConnectionError(f"Failed to connect to external API: {str(e)}") from e
-    
+
     async def query_external_api_async(self, query: str, max_tokens: int = None, model: str = None, **options) -> str:
         """
         Async version: Send a direct query to external API for simple questions and chat
@@ -214,7 +231,9 @@ class ExternalAPIClient:
             ]
             
             # Route to appropriate API based on provider
-            if self.api_provider == "gemini":
+            if self.api_provider == "claude-cli":
+                response_json = await self._call_claude_cli_api_async(model, messages, max_tokens, **options)
+            elif self.api_provider == "gemini":
                 response_json = await self._call_gemini_api_async(model, messages, max_tokens=max_tokens, **options)
             elif self.api_provider == "grok":
                 response_json = await self._call_grok_api_async(model, messages, max_tokens=max_tokens, **options)
@@ -424,6 +443,46 @@ class ExternalAPIClient:
             logger.error(f"Request failed: {e}", exc_info=True)
             raise
     
+    @staticmethod
+    def _apply_thinking_params(params: Dict[str, Any], config) -> None:
+        """
+        Mutate params dict to include extended thinking if the model supports it.
+
+        Extended thinking is enabled when:
+        - config.THINKING_BUDGET_TOKENS > 0
+        - The model name contains "opus" (case-insensitive)
+
+        When enabled, this sets the thinking budget, forces temperature=1
+        (required by the Anthropic API for thinking), and increases max_tokens
+        to accommodate the thinking output alongside the normal response.
+        """
+        model = params.get("model", "")
+        if config.THINKING_BUDGET_TOKENS > 0 and "opus" in model.lower():
+            params["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": config.THINKING_BUDGET_TOKENS,
+            }
+            # Extended thinking requires temperature=1
+            params["temperature"] = 1
+            # Increase max_tokens to accommodate thinking output
+            original_max = params.get("max_tokens", 2000)
+            params["max_tokens"] = max(original_max, config.THINKING_BUDGET_TOKENS + original_max)
+
+    @staticmethod
+    def _extract_anthropic_response_text(response) -> str:
+        """
+        Extract concatenated text from an Anthropic response.
+
+        Extended thinking responses contain multiple content blocks (thinking
+        blocks + text blocks). This method iterates all blocks and concatenates
+        only the ones that have a .text attribute, skipping thinking blocks.
+        """
+        response_text = ""
+        for block in response.content:
+            if hasattr(block, 'text'):
+                response_text += block.text
+        return response_text
+
     def _call_anthropic_api(self, model: str, messages: List[Dict[str, Any]], max_tokens: int, **options) -> Dict[str, Any]:
         """Make API call to Anthropic Claude with specified model and parameters"""
         temperature = options.get('temperature', 0.1)
@@ -460,13 +519,16 @@ class ExternalAPIClient:
                 if k not in internal_options and k not in params:
                     params[k] = v
 
+            # Add extended thinking if configured and model supports it
+            self._apply_thinking_params(params, model_config)
+
             # Call Anthropic API
             response = self.anthropic_client.messages.create(**params)
-            
-            # Extract text from response
-            response_text = response.content[0].text
+
+            # Extract text from response — handle extended thinking content blocks
+            response_text = self._extract_anthropic_response_text(response)
             logger.debug(f"Claude response length: {len(response_text)} characters")
-            
+
             # Create normalized response structure matching OpenAI format
             normalized = {
                 'choices': [
@@ -479,13 +541,114 @@ class ExternalAPIClient:
                     'total_tokens': response.usage.input_tokens + response.usage.output_tokens,
                 }
             }
-            
+
             return normalized
-            
+
         except Exception as e:
             logger.error(f"Anthropic request failed: {e}", exc_info=True)
             raise
     
+    def _call_claude_cli_api(self, model: str, messages: List[Dict[str, Any]], max_tokens: int, **options) -> Dict[str, Any]:
+        """Make LLM call via claude CLI subprocess.
+
+        Shells out to the claude binary in print mode. Uses
+        --dangerously-skip-permissions to prevent interactive permission
+        prompts from hanging the subprocess.
+        """
+        # Separate system content from user content
+        system_content = ""
+        user_parts = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_content = msg["content"]
+            else:
+                user_parts.append(msg["content"])
+
+        full_prompt = "\n\n".join(user_parts)
+
+        # Build command
+        cmd = [
+            "claude", "--model", model, "-p",
+            "--no-session-persistence",
+            "--dangerously-skip-permissions",
+        ]
+        if system_content:
+            cmd.extend(["--append-system-prompt", system_content])
+
+        # Clean environment — remove CLAUDECODE to avoid nested-session detection
+        # when HMLR runs as an MCP server inside Claude Code
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
+        # Run subprocess, pipe prompt via stdin
+        result = subprocess.run(
+            cmd,
+            input=full_prompt,
+            capture_output=True,
+            text=True,
+            timeout=options.get("timeout", 120),
+            env=env,
+        )
+
+        if result.returncode != 0:
+            raise ApiConnectionError(f"claude CLI failed: {result.stderr}")
+
+        # Return normalized response (matches OpenAI format used by all providers)
+        return {
+            "choices": [{"message": {"content": result.stdout.strip()}}],
+            "model": model,
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
+    async def _call_claude_cli_api_async(self, model: str, messages: List[Dict[str, Any]], max_tokens: int, **options) -> Dict[str, Any]:
+        """Async variant: Make LLM call via claude CLI subprocess.
+
+        Uses asyncio.create_subprocess_exec for non-blocking subprocess
+        execution. Same command structure as the sync version.
+        """
+        # Separate system content from user content
+        system_content = ""
+        user_parts = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_content = msg["content"]
+            else:
+                user_parts.append(msg["content"])
+
+        full_prompt = "\n\n".join(user_parts)
+
+        # Build command
+        cmd = [
+            "claude", "--model", model, "-p",
+            "--no-session-persistence",
+            "--dangerously-skip-permissions",
+        ]
+        if system_content:
+            cmd.extend(["--append-system-prompt", system_content])
+
+        # Clean environment — remove CLAUDECODE to avoid nested-session detection
+        # when HMLR runs as an MCP server inside Claude Code
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
+        # Run async subprocess
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await process.communicate(input=full_prompt.encode())
+
+        if process.returncode != 0:
+            raise ApiConnectionError(f"claude CLI failed: {stderr.decode()}")
+
+        # Return normalized response
+        return {
+            "choices": [{"message": {"content": stdout.decode().strip()}}],
+            "model": model,
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
     # ========================================================================
     # ASYNC VERSIONS OF API CALLS (Priority 6: Native Async Support)
     # ========================================================================
@@ -629,18 +792,24 @@ class ExternalAPIClient:
                 elif role == 'assistant':
                     user_messages.append({"role": "assistant", "content": content})
             
+            # Build params dict so _apply_thinking_params can mutate it
+            params = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "system": system_content if system_content else None,
+                "messages": user_messages,
+                "timeout": timeout,
+            }
+
+            # Add extended thinking if configured and model supports it
+            self._apply_thinking_params(params, model_config)
+
             # Call async Anthropic API
-            response = await self.async_anthropic_client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=system_content if system_content else None,
-                messages=user_messages,
-                timeout=timeout
-            )
-            
-            # Extract text from response
-            response_text = response.content[0].text
+            response = await self.async_anthropic_client.messages.create(**params)
+
+            # Extract text from response — handle extended thinking content blocks
+            response_text = self._extract_anthropic_response_text(response)
             logger.debug(f"Claude async response length: {len(response_text)} characters")
             
             # Create normalized response structure

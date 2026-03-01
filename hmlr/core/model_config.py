@@ -181,7 +181,16 @@ class ModelConfig:
         float(os.getenv("HMLR_DEFAULT_PRESENCE_PENALTY"))
         if os.getenv("HMLR_DEFAULT_PRESENCE_PENALTY") else None
     )
-    
+
+    # ===== EXTENDED THINKING (Anthropic-specific) =====
+    # Budget for extended thinking on supported models (Opus)
+    # Set to 0 to disable extended thinking
+    THINKING_BUDGET_TOKENS: int = int(os.getenv("HMLR_THINKING_BUDGET", "10000"))
+
+    # Which operations use extended thinking (only meaningful for Anthropic Opus)
+    MAIN_USES_THINKING: bool = os.getenv("HMLR_MAIN_USES_THINKING", "True").lower() == "true"
+    SYNTHESIS_USES_THINKING: bool = os.getenv("HMLR_SYNTHESIS_USES_THINKING", "True").lower() == "true"
+
     # ===== INTENT & RETRIEVAL =====
     # Use LLM for intent detection (True) or keyword-based heuristics (False)
     USE_LLM_INTENT_MODE: bool = os.getenv("HMLR_USE_LLM_INTENT_MODE", "False").lower() == "true"
