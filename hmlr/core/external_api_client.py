@@ -575,6 +575,10 @@ class ExternalAPIClient:
         if system_content:
             cmd.extend(["--append-system-prompt", system_content])
 
+        # Clean environment — remove CLAUDECODE to avoid nested-session detection
+        # when HMLR runs as an MCP server inside Claude Code
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
         # Run subprocess, pipe prompt via stdin
         result = subprocess.run(
             cmd,
@@ -582,6 +586,7 @@ class ExternalAPIClient:
             capture_output=True,
             text=True,
             timeout=options.get("timeout", 120),
+            env=env,
         )
 
         if result.returncode != 0:
@@ -620,12 +625,17 @@ class ExternalAPIClient:
         if system_content:
             cmd.extend(["--append-system-prompt", system_content])
 
+        # Clean environment — remove CLAUDECODE to avoid nested-session detection
+        # when HMLR runs as an MCP server inside Claude Code
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
         # Run async subprocess
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         stdout, stderr = await process.communicate(input=full_prompt.encode())
 

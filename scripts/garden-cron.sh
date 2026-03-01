@@ -8,6 +8,9 @@
 
 set -euo pipefail
 
+# Ensure claude CLI and uv are on PATH for cron's minimal environment
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
+
 HMLR_DIR="${HMLR_DIR:-$HOME/code/hmlr-memory}"
 LOG_DIR="${HOME}/.hmlr/logs"
 LOG_FILE="${LOG_DIR}/gardener-$(date +%Y-%m-%d).log"

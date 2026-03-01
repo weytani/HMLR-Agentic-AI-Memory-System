@@ -287,6 +287,31 @@ async def test_query_external_api_async_routes_to_claude_cli():
 
 
 # ============================================================
+# Environment isolation
+# ============================================================
+
+def test_call_claude_cli_api_strips_claudecode_env(monkeypatch):
+    """CLAUDECODE env var should be stripped to avoid nested-session detection."""
+    monkeypatch.setenv("CLAUDECODE", "1")
+
+    with patch("shutil.which", return_value="/usr/local/bin/claude"):
+        client = ExternalAPIClient(api_provider="claude-cli")
+
+    messages = [{"role": "user", "content": "test"}]
+
+    fake_result = MagicMock()
+    fake_result.returncode = 0
+    fake_result.stdout = "ok"
+    fake_result.stderr = ""
+
+    with patch("subprocess.run", return_value=fake_result) as mock_run:
+        client._call_claude_cli_api("claude-sonnet-4-6", messages, 2000)
+
+    passed_env = mock_run.call_args.kwargs["env"]
+    assert "CLAUDECODE" not in passed_env
+
+
+# ============================================================
 # Extended thinking skip
 # ============================================================
 
