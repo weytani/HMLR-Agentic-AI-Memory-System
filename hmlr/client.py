@@ -90,9 +90,9 @@ class HMLRClient:
         )
         
         return {
-            "content": response.content,
+            "content": response.response_text,
             "status": response.status.value,
-            "metadata": response.metadata if hasattr(response, 'metadata') else {}
+            "metadata": response.to_dict().get("metadata", {})
         }
     
     def get_memory_stats(self) -> Dict[str, Any]:
