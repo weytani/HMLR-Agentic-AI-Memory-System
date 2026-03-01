@@ -424,6 +424,46 @@ class ExternalAPIClient:
             logger.error(f"Request failed: {e}", exc_info=True)
             raise
     
+    @staticmethod
+    def _apply_thinking_params(params: Dict[str, Any], config) -> None:
+        """
+        Mutate params dict to include extended thinking if the model supports it.
+
+        Extended thinking is enabled when:
+        - config.THINKING_BUDGET_TOKENS > 0
+        - The model name contains "opus" (case-insensitive)
+
+        When enabled, this sets the thinking budget, forces temperature=1
+        (required by the Anthropic API for thinking), and increases max_tokens
+        to accommodate the thinking output alongside the normal response.
+        """
+        model = params.get("model", "")
+        if config.THINKING_BUDGET_TOKENS > 0 and "opus" in model.lower():
+            params["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": config.THINKING_BUDGET_TOKENS,
+            }
+            # Extended thinking requires temperature=1
+            params["temperature"] = 1
+            # Increase max_tokens to accommodate thinking output
+            original_max = params.get("max_tokens", 2000)
+            params["max_tokens"] = max(original_max, config.THINKING_BUDGET_TOKENS + original_max)
+
+    @staticmethod
+    def _extract_anthropic_response_text(response) -> str:
+        """
+        Extract concatenated text from an Anthropic response.
+
+        Extended thinking responses contain multiple content blocks (thinking
+        blocks + text blocks). This method iterates all blocks and concatenates
+        only the ones that have a .text attribute, skipping thinking blocks.
+        """
+        response_text = ""
+        for block in response.content:
+            if hasattr(block, 'text'):
+                response_text += block.text
+        return response_text
+
     def _call_anthropic_api(self, model: str, messages: List[Dict[str, Any]], max_tokens: int, **options) -> Dict[str, Any]:
         """Make API call to Anthropic Claude with specified model and parameters"""
         temperature = options.get('temperature', 0.1)
@@ -460,13 +500,16 @@ class ExternalAPIClient:
                 if k not in internal_options and k not in params:
                     params[k] = v
 
+            # Add extended thinking if configured and model supports it
+            self._apply_thinking_params(params, model_config)
+
             # Call Anthropic API
             response = self.anthropic_client.messages.create(**params)
-            
-            # Extract text from response
-            response_text = response.content[0].text
+
+            # Extract text from response — handle extended thinking content blocks
+            response_text = self._extract_anthropic_response_text(response)
             logger.debug(f"Claude response length: {len(response_text)} characters")
-            
+
             # Create normalized response structure matching OpenAI format
             normalized = {
                 'choices': [
@@ -479,9 +522,9 @@ class ExternalAPIClient:
                     'total_tokens': response.usage.input_tokens + response.usage.output_tokens,
                 }
             }
-            
+
             return normalized
-            
+
         except Exception as e:
             logger.error(f"Anthropic request failed: {e}", exc_info=True)
             raise
@@ -629,18 +672,24 @@ class ExternalAPIClient:
                 elif role == 'assistant':
                     user_messages.append({"role": "assistant", "content": content})
             
+            # Build params dict so _apply_thinking_params can mutate it
+            params = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "system": system_content if system_content else None,
+                "messages": user_messages,
+                "timeout": timeout,
+            }
+
+            # Add extended thinking if configured and model supports it
+            self._apply_thinking_params(params, model_config)
+
             # Call async Anthropic API
-            response = await self.async_anthropic_client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=system_content if system_content else None,
-                messages=user_messages,
-                timeout=timeout
-            )
-            
-            # Extract text from response
-            response_text = response.content[0].text
+            response = await self.async_anthropic_client.messages.create(**params)
+
+            # Extract text from response — handle extended thinking content blocks
+            response_text = self._extract_anthropic_response_text(response)
             logger.debug(f"Claude async response length: {len(response_text)} characters")
             
             # Create normalized response structure
