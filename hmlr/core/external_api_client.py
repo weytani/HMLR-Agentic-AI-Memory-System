@@ -5,6 +5,8 @@ Sends relevant chunks to external APIs (OpenAI, Claude, etc.) for enhanced analy
 
 import os
 import json
+import shutil
+import subprocess
 import requests
 import httpx
 import asyncio
@@ -45,8 +47,9 @@ class ExternalAPIClient:
         Initialize ExternalAPIClient with API provider configuration.
 
         Args:
-            api_provider: API provider to use ("openai", "gemini", "grok", "anthropic")
+            api_provider: API provider to use ("openai", "gemini", "grok", "anthropic", "claude-cli")
             api_key: Optional API key. If not provided, will look in environment.
+                     Not used for "claude-cli" provider.
         """
         self.api_provider = api_provider
         self.api_key = self._load_api_key(api_key)
@@ -86,6 +89,13 @@ class ExternalAPIClient:
             # Initialize async Anthropic client
             self.async_anthropic_client = anthropic.AsyncAnthropic(api_key=key)
             return key
+        elif self.api_provider == "claude-cli":
+            # No API key needed — calls go through the claude CLI binary
+            if not shutil.which("claude"):
+                raise ConfigurationError(
+                    "claude CLI not found on PATH. Install Claude Code or add it to PATH."
+                )
+            return ""
         else:
             raise ConfigurationError(f"Unsupported API provider: {self.api_provider}")
     
@@ -99,11 +109,16 @@ class ExternalAPIClient:
             return ""  # Grok uses SDK, not REST base URL
         elif self.api_provider == "anthropic":
             return ""  # Anthropic uses SDK, not REST base URL
+        elif self.api_provider == "claude-cli":
+            return ""  # CLI provider uses subprocess, not HTTP
         else:
             raise ConfigurationError(f"Unsupported API provider: {self.api_provider}")
 
     def _fetch_available_models(self) -> List[str]:
         """Fetch available model ids for this API key."""
+        if self.api_provider == "claude-cli":
+            # CLI provider doesn't support listing models via HTTP
+            return []
         try:
             headers = {"Authorization": f"Bearer {self.api_key}"}
             resp = requests.get(f"{self.base_url}/models", headers=headers, timeout=10)
@@ -151,7 +166,9 @@ class ExternalAPIClient:
             ]
             
             # Route to appropriate API based on provider
-            if self.api_provider == "gemini":
+            if self.api_provider == "claude-cli":
+                response_json = self._call_claude_cli_api(model, messages, max_tokens, **options)
+            elif self.api_provider == "gemini":
                 response_json = self._call_gemini_api(model, messages, max_tokens=max_tokens, **options)
             elif self.api_provider == "grok":
                 response_json = self._call_grok_api(model, messages, max_tokens=max_tokens, **options)
@@ -174,11 +191,11 @@ class ExternalAPIClient:
                     content = str(content)
 
             return content
-            
+
         except Exception as e:
             logger.error(f"Direct query failed: {e}", exc_info=True)
             raise ApiConnectionError(f"Failed to connect to external API: {str(e)}") from e
-    
+
     async def query_external_api_async(self, query: str, max_tokens: int = None, model: str = None, **options) -> str:
         """
         Async version: Send a direct query to external API for simple questions and chat
@@ -214,7 +231,9 @@ class ExternalAPIClient:
             ]
             
             # Route to appropriate API based on provider
-            if self.api_provider == "gemini":
+            if self.api_provider == "claude-cli":
+                response_json = await self._call_claude_cli_api_async(model, messages, max_tokens, **options)
+            elif self.api_provider == "gemini":
                 response_json = await self._call_gemini_api_async(model, messages, max_tokens=max_tokens, **options)
             elif self.api_provider == "grok":
                 response_json = await self._call_grok_api_async(model, messages, max_tokens=max_tokens, **options)
@@ -529,6 +548,97 @@ class ExternalAPIClient:
             logger.error(f"Anthropic request failed: {e}", exc_info=True)
             raise
     
+    def _call_claude_cli_api(self, model: str, messages: List[Dict[str, Any]], max_tokens: int, **options) -> Dict[str, Any]:
+        """Make LLM call via claude CLI subprocess.
+
+        Shells out to the claude binary in print mode. Uses
+        --dangerously-skip-permissions to prevent interactive permission
+        prompts from hanging the subprocess.
+        """
+        # Separate system content from user content
+        system_content = ""
+        user_parts = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_content = msg["content"]
+            else:
+                user_parts.append(msg["content"])
+
+        full_prompt = "\n\n".join(user_parts)
+
+        # Build command
+        cmd = [
+            "claude", "--model", model, "-p",
+            "--no-session-persistence",
+            "--dangerously-skip-permissions",
+        ]
+        if system_content:
+            cmd.extend(["--append-system-prompt", system_content])
+
+        # Run subprocess, pipe prompt via stdin
+        result = subprocess.run(
+            cmd,
+            input=full_prompt,
+            capture_output=True,
+            text=True,
+            timeout=options.get("timeout", 120),
+        )
+
+        if result.returncode != 0:
+            raise ApiConnectionError(f"claude CLI failed: {result.stderr}")
+
+        # Return normalized response (matches OpenAI format used by all providers)
+        return {
+            "choices": [{"message": {"content": result.stdout.strip()}}],
+            "model": model,
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
+    async def _call_claude_cli_api_async(self, model: str, messages: List[Dict[str, Any]], max_tokens: int, **options) -> Dict[str, Any]:
+        """Async variant: Make LLM call via claude CLI subprocess.
+
+        Uses asyncio.create_subprocess_exec for non-blocking subprocess
+        execution. Same command structure as the sync version.
+        """
+        # Separate system content from user content
+        system_content = ""
+        user_parts = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_content = msg["content"]
+            else:
+                user_parts.append(msg["content"])
+
+        full_prompt = "\n\n".join(user_parts)
+
+        # Build command
+        cmd = [
+            "claude", "--model", model, "-p",
+            "--no-session-persistence",
+            "--dangerously-skip-permissions",
+        ]
+        if system_content:
+            cmd.extend(["--append-system-prompt", system_content])
+
+        # Run async subprocess
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate(input=full_prompt.encode())
+
+        if process.returncode != 0:
+            raise ApiConnectionError(f"claude CLI failed: {stderr.decode()}")
+
+        # Return normalized response
+        return {
+            "choices": [{"message": {"content": stdout.decode().strip()}}],
+            "model": model,
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
     # ========================================================================
     # ASYNC VERSIONS OF API CALLS (Priority 6: Native Async Support)
     # ========================================================================
