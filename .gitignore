@@ -296,4 +296,4 @@ test_output/
 # Temporary packaging files
 packaging_plan.md
 
-longmemeval_s_cleaned.json
+longmemeval_s_cleaned.json.DS_Store
